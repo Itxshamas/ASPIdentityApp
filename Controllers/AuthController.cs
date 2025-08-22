@@ -6,7 +6,6 @@ using Microsoft.AspNetCore.Mvc;
 namespace ASPIdentityApp.Controllers
 {
     [ApiController]
-    // [Authorize]
     [Route("api/[controller]")]
     public class AuthController : ControllerBase
     {
@@ -19,8 +18,9 @@ namespace ASPIdentityApp.Controllers
             _logger = logger;
         }
 
+        [AllowAnonymous]
         [HttpPost("register")]
-        public async Task<IActionResult> Register([FromBody] RegisterRequest request)
+        public async Task<IActionResult> Register([FromBody] RegisterRequestDto request)
         {
             try
             {
@@ -34,8 +34,9 @@ namespace ASPIdentityApp.Controllers
             }
         }
 
+        [AllowAnonymous]
         [HttpPost("login")]
-        public async Task<IActionResult> Login([FromBody] LoginRequest request)
+        public async Task<IActionResult> Login([FromBody] LoginRequestDto request)
         {
             try
             {
@@ -53,6 +54,7 @@ namespace ASPIdentityApp.Controllers
             }
         }
 
+        [Authorize]
         [HttpPost("logout/{userId}")]
         public async Task<IActionResult> Logout(string userId)
         {

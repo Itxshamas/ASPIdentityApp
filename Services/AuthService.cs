@@ -1,14 +1,14 @@
 using ASPIdentityApp.Data;
 using ASPIdentityApp.DTOs;
+using ASPIdentityApp.Entities;
 using ASPIdentityApp.Interfaces;
+using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.IdentityModel.Tokens;
-using System;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
-using System.Threading.Tasks;
 
 namespace ASPIdentityApp.Services
 {
@@ -16,84 +16,137 @@ namespace ASPIdentityApp.Services
     {
         private readonly AppDbContext _context;
         private readonly IConfiguration _configuration;
+        private readonly PasswordHasher<RegisterRequest> _passwordHasher;
 
         public AuthService(AppDbContext context, IConfiguration configuration)
         {
             _context = context;
             _configuration = configuration;
+            _passwordHasher = new PasswordHasher<RegisterRequest>();
         }
 
-        public async Task<AuthResponse> RegisterAsync(RegisterRequest request)
+        public async Task<AuthResponseDto> RegisterAsync(RegisterRequestDto request)
         {
-            // Save registration info
-            _context.RegisterRequests.Add(request);
-            await _context.SaveChangesAsync();
+            // check if email exists
+            var exists = await _context.RegisterRequests.AnyAsync(r => r.Email == request.Email);
+            if (exists) throw new Exception("Email already registered.");
 
-            var response = new AuthResponse
+            var registerEntity = new RegisterRequest
             {
-                Email = request.Email,
-                UserId = request.Id.ToString(),
-                Token = Guid.NewGuid().ToString(),
-                Expiration = DateTime.UtcNow.AddHours(1)
+                Email = request.Email
             };
 
-            _context.AuthResponses.Add(response);
+            // hash password
+            registerEntity.Password = _passwordHasher.HashPassword(registerEntity, request.Password);
+
+            _context.RegisterRequests.Add(registerEntity);
             await _context.SaveChangesAsync();
 
-            return response;
+            // Generate token
+            var token = GenerateJwtToken(registerEntity.Id.ToString(), registerEntity.Email, out DateTime expiry);
+
+            var authResponse = new AuthResponse
+            {
+                UserId = registerEntity.Id.ToString(),
+                Email = registerEntity.Email,
+                Token = token,
+                Expiration = expiry
+            };
+
+            _context.AuthResponses.Add(authResponse);
+            await _context.SaveChangesAsync();
+
+            return new AuthResponseDto
+            {
+                Token = authResponse.Token,
+                Expiration = authResponse.Expiration,
+                Email = authResponse.Email,
+                UserId = authResponse.UserId
+            };
         }
 
-        public async Task<AuthResponse> LoginAsync(LoginRequest request)
+        public async Task<AuthResponseDto> LoginAsync(LoginRequestDto request)
         {
-            var user = await _context.RegisterRequests
-                .FirstOrDefaultAsync(u => u.Email == request.Email && u.Password == request.Password);
+            var user = await _context.RegisterRequests.FirstOrDefaultAsync(u => u.Email == request.Email);
+            if (user == null) throw new UnauthorizedAccessException("Invalid email or password.");
 
-            if (user == null)
-                throw new UnauthorizedAccessException("Invalid email or password");
+            var verification = _passwordHasher.VerifyHashedPassword(user, user.Password, request.Password);
 
-            var tokenHandler = new JwtSecurityTokenHandler();
-            var key = Encoding.ASCII.GetBytes(_configuration["Jwt:Key"]);
-            var tokenDescriptor = new SecurityTokenDescriptor
+            // If password doesn't match hashed value, but stored value equals plain text (legacy), accept and re-hash.
+            if (verification == PasswordVerificationResult.Failed)
             {
-                Subject = new ClaimsIdentity(new Claim[]
+                if (user.Password == request.Password)
                 {
-                    new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
-                    new Claim(ClaimTypes.Email, user.Email)
-                }),
-                Expires = DateTime.UtcNow.AddHours(1),
-                Issuer = _configuration["Jwt:Issuer"],
-                Audience = _configuration["Jwt:Audience"],
-                SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(key), SecurityAlgorithms.HmacSha256Signature)
-            };
-            var token = tokenHandler.CreateToken(tokenDescriptor);
-            var tokenString = tokenHandler.WriteToken(token);
+                    // legacy plaintext password — re-hash for future
+                    user.Password = _passwordHasher.HashPassword(user, request.Password);
+                    _context.RegisterRequests.Update(user);
+                    await _context.SaveChangesAsync();
+                }
+                else
+                {
+                    throw new UnauthorizedAccessException("Invalid email or password.");
+                }
+            }
+
+            // generate JWT
+            var token = GenerateJwtToken(user.Id.ToString(), user.Email, out DateTime expiry);
 
             var response = new AuthResponse
             {
-                Email = user.Email,
                 UserId = user.Id.ToString(),
-                Token = tokenString,
-                Expiration = token.ValidTo
+                Email = user.Email,
+                Token = token,
+                Expiration = expiry
             };
 
-            // Storing the token in the database might not be necessary if you are not tracking active sessions.
-            // If you do need to track active sessions, you should store the token and its expiration.
             _context.AuthResponses.Add(response);
             await _context.SaveChangesAsync();
 
-            return response;
+            return new AuthResponseDto
+            {
+                Token = response.Token,
+                Expiration = response.Expiration,
+                Email = response.Email,
+                UserId = response.UserId
+            };
         }
 
         public async Task<bool> LogoutAsync(string userId)
         {
-            var tokens = await _context.AuthResponses
-                .Where(r => r.UserId == userId)
-                .ToListAsync();
-
-            _context.AuthResponses.RemoveRange(tokens);
-            await _context.SaveChangesAsync();
-
+            var tokens = await _context.AuthResponses.Where(a => a.UserId == userId).ToListAsync();
+            if (tokens.Any())
+            {
+                _context.AuthResponses.RemoveRange(tokens);
+                await _context.SaveChangesAsync();
+            }
             return true;
+        }
+
+        private string GenerateJwtToken(string userId, string email, out DateTime validTo)
+        {
+            var key = Encoding.UTF8.GetBytes(_configuration["Jwt:Key"]);
+            var issuer = _configuration["Jwt:Issuer"];
+            var audience = _configuration["Jwt:Audience"];
+
+            var tokenHandler = new JwtSecurityTokenHandler();
+            var claims = new[]
+            {
+                new Claim(ClaimTypes.NameIdentifier, userId),
+                new Claim(ClaimTypes.Email, email)
+            };
+
+            var tokenDescriptor = new SecurityTokenDescriptor
+            {
+                Subject = new ClaimsIdentity(claims),
+                Expires = DateTime.UtcNow.AddMinutes(5),
+                Issuer = issuer,
+                Audience = audience,
+                SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(key), SecurityAlgorithms.HmacSha256Signature)
+            };
+
+            var token = tokenHandler.CreateToken(tokenDescriptor);
+            validTo = token.ValidTo;
+            return tokenHandler.WriteToken(token);
         }
     }
 }
